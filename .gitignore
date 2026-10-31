@@ -36,3 +36,4 @@ node_modules
 .next
 .env*.local
 __pycache__/
+.venv/

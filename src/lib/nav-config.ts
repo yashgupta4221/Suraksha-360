@@ -7,6 +7,7 @@ import {
   MessageSquareWarning,
   ShieldHalf,
   History,
+  Cctv,
   type LucideIcon,
 } from "lucide-react";
 
@@ -23,6 +24,7 @@ export const primaryNav: NavItem[] = [
   { labelKey: "nav.guardian", href: "/guardian", icon: ShieldHalf },
   { labelKey: "nav.journeys", href: "/journeys", icon: History },
   { labelKey: "nav.alerts", href: "/alerts", icon: ShieldAlert },
+  { labelKey: "nav.cctv", href: "/cctv", icon: Cctv },
 ];
 
 export const secondaryNav: NavItem[] = [

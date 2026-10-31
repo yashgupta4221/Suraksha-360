@@ -24,6 +24,7 @@ export const dictionary: Dict = {
   "nav.community": { en: "Community", hi: "समुदाय", bn: "সম্প্রদায়", ta: "சமூகம்", te: "సంఘం", mr: "समुदाय" },
   "nav.guardian": { en: "Guardian", hi: "गार्जियन", bn: "গার্ডিয়ান", ta: "பாதுகாவலர்", te: "గార్డియన్", mr: "गार्डियन" },
   "nav.alerts": { en: "Alerts", hi: "अलर्ट", bn: "সতর্কতা", ta: "எச்சரிக்கைகள்", te: "హెచ్చరికలు", mr: "इशारे" },
+  "nav.cctv": { en: "CCTV", hi: "सीसीटीवी", bn: "সিসিটিভি", ta: "சிசிடிவி", te: "సీసీటీవీ", mr: "सीसीटीव्ही" },
   "nav.journeys": { en: "Journeys", hi: "यात्राएँ", bn: "যাত্রা", ta: "பயணங்கள்", te: "ప్రయాణాలు", mr: "प्रवास" },
   "nav.profile": { en: "Profile", hi: "प्रोफ़ाइल", bn: "প্রোফাইল", ta: "சுயவிவரம்", te: "ప్రొఫైల్", mr: "प्रोफाइल" },
   "nav.settings": { en: "Settings", hi: "सेटिंग्स", bn: "সেটিংস", ta: "அமைப்புகள்", te: "సెట్టింగ్‌లు", mr: "सेटिंग्ज" },
