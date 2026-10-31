@@ -4,7 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 
 const VISION = process.env.NEXT_PUBLIC_VISION_URL ?? "http://localhost:8000";
 
-type Camera = { id: string; online: boolean; persons?: number; fps?: number };
+type Camera = { id: string; online: boolean; persons?: number; seen?: number; fps?: number };
 
 export default function CctvPage() {
   const { data: cams = [], isLoading, isError } = useQuery<Camera[]>({
@@ -56,7 +56,7 @@ export default function CctvPage() {
               <div className="flex items-center gap-3">
                 {c.online && typeof c.persons === "number" && (
                   <span className="text-muted-foreground">
-                    👤 {c.persons} {c.persons === 1 ? "person" : "persons"}
+                    👤 {c.persons} now · {c.seen ?? 0} seen
                   </span>
                 )}
                 <span className={c.online ? "text-green-500" : "text-red-500"}>

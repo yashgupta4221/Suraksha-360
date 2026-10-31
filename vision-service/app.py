@@ -1,6 +1,7 @@
 import os
 import threading
 import time
+from collections import deque
 
 import cv2
 from fastapi import FastAPI, HTTPException
@@ -13,11 +14,13 @@ ROTATION = int(os.getenv("ROTATION", "0"))
 ROTATE_CODES = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
 FRAME_WIDTH = int(os.getenv("FRAME_WIDTH", "640"))
 DETECT = os.getenv("DETECT", "1") == "1"
+TRACK = os.getenv("TRACK", "1") == "1"
+TRAIL_LEN = int(os.getenv("TRAIL_LEN", "30"))
+TRACK_TTL = float(os.getenv("TRACK_TTL", "3"))
+MIN_SEEN_SECONDS = float(os.getenv("MIN_SEEN_SECONDS", "1.5"))
 
-detector = None
 if DETECT:
     from detector import PersonDetector
-    detector = PersonDetector()
 
 app = FastAPI(title="Suraksha360 Vision Service")
 app.add_middleware(
@@ -26,6 +29,15 @@ app.add_middleware(
     allow_methods=["GET"],
     allow_headers=["*"],
 )
+
+PALETTE = [
+    (80, 220, 100), (255, 170, 60), (60, 170, 255), (220, 90, 220),
+    (90, 230, 230), (240, 240, 90), (150, 120, 255), (255, 120, 120),
+]
+
+
+def color_for(track_id):
+    return PALETTE[track_id % len(PALETTE)] if track_id is not None else PALETTE[0]
 
 
 def prepare(frame):
@@ -38,31 +50,60 @@ def prepare(frame):
     return frame
 
 
-def draw(frame, detections):
-    green = (80, 220, 100)
+def draw(frame, detections, trails, total_seen):
     for i, d in enumerate(detections, start=1):
         x1, y1, x2, y2 = d["box"]
-        cv2.rectangle(frame, (x1, y1), (x2, y2), green, 2)
-        label = f"Person {i}  {d['conf']:.2f}"
-        cv2.putText(frame, label, (x1, max(y1 - 8, 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, green, 2)
-    cv2.rectangle(frame, (0, 0), (150, 30), (0, 0, 0), -1)
-    cv2.putText(frame, f"Persons: {len(detections)}", (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        tid = d.get("id")
+        color = color_for(tid)
+        points = trails.get(tid, [])
+        for a, b in zip(points, points[1:]):
+            cv2.line(frame, a, b, color, 2)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        label = f"ID {tid}" if tid is not None else f"Person {i}"
+        label += f"  {d['conf']:.2f}"
+        cv2.putText(frame, label, (x1, max(y1 - 8, 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    header = f"Persons: {len(detections)}   Seen: {total_seen}"
+    cv2.rectangle(frame, (0, 0), (260, 30), (0, 0, 0), -1)
+    cv2.putText(frame, header, (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     return frame
 
 
 class CameraWorker:
-    """Reads the newest camera frame, runs detection once, and keeps the
-    annotated JPEG + detections ready for every viewer."""
+    """Reads the newest camera frame, runs detection + tracking once, and
+    keeps the annotated JPEG + detections ready for every viewer."""
 
     def __init__(self, cam_id, source):
         self.id = cam_id
         self.stream = VideoStream(source)
+        self.detector = PersonDetector() if DETECT else None
         self.lock = threading.Lock()
         self.jpeg = None
         self.detections = []
         self.fps = 0.0
         self.updated = 0.0
+        self.tracks = {}
+        self.seen_ids = set()
         threading.Thread(target=self._loop, daemon=True).start()
+
+    def _update_tracks(self, detections, now):
+        for d in detections:
+            tid = d.get("id")
+            if tid is None:
+                continue
+            x1, y1, x2, y2 = d["box"]
+            center = ((x1 + x2) // 2, (y1 + y2) // 2)
+            track = self.tracks.get(tid)
+            if track is None:
+                track = {"first_seen": now, "trail": deque(maxlen=TRAIL_LEN)}
+                self.tracks[tid] = track
+            track["last_seen"] = now
+            track["trail"].append(center)
+            d["duration"] = round(now - track["first_seen"], 1)
+            if d["duration"] >= MIN_SEEN_SECONDS:
+                self.seen_ids.add(tid)
+        for tid in [k for k, t in self.tracks.items() if now - t["last_seen"] > TRACK_TTL]:
+            del self.tracks[tid]
+        return {tid: list(t["trail"]) for tid, t in self.tracks.items()}
 
     def _loop(self):
         last_frame_time = 0.0
@@ -78,8 +119,9 @@ class CameraWorker:
 
             start = time.time()
             frame = prepare(frame)
-            detections = detector.detect(frame) if detector else []
-            frame = draw(frame, detections)
+            detections = self.detector.detect(frame, track=TRACK) if self.detector else []
+            trails = self._update_tracks(detections, time.time())
+            frame = draw(frame, detections, trails, len(self.seen_ids))
             _, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
             elapsed = time.time() - start
 
@@ -95,7 +137,7 @@ class CameraWorker:
 
     def snapshot(self):
         with self.lock:
-            return self.jpeg, list(self.detections), self.fps, self.updated
+            return self.jpeg, list(self.detections), self.fps, self.updated, len(self.seen_ids)
 
 
 workers = {
@@ -114,29 +156,35 @@ def get_worker(cam_id):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "cameras": len(workers), "detection": detector is not None}
+    return {"ok": True, "cameras": len(workers), "detection": DETECT, "tracking": DETECT and TRACK}
 
 
 @app.get("/cameras")
 def list_cameras():
     result = []
     for cid, w in workers.items():
-        _, dets, fps, _ = w.snapshot()
-        result.append({"id": cid, "online": w.online(), "persons": len(dets), "fps": round(fps, 1)})
+        _, dets, fps, _, seen = w.snapshot()
+        result.append({
+            "id": cid, "online": w.online(), "persons": len(dets),
+            "seen": seen, "fps": round(fps, 1),
+        })
     return result
 
 
 @app.get("/detections/{cam_id}")
 def detections(cam_id: str):
     w = get_worker(cam_id)
-    _, dets, fps, updated = w.snapshot()
-    return {"id": cam_id, "persons": len(dets), "fps": round(fps, 1), "updated": updated, "detections": dets}
+    _, dets, fps, updated, seen = w.snapshot()
+    return {
+        "id": cam_id, "persons": len(dets), "seen": seen, "fps": round(fps, 1),
+        "updated": updated, "detections": dets,
+    }
 
 
 def mjpeg(worker, max_fps=15):
     last = 0.0
     while True:
-        jpg, _, _, updated = worker.snapshot()
+        jpg, _, _, updated, _ = worker.snapshot()
         if jpg is not None and updated != last:
             last = updated
             yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
