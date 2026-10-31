@@ -1,13 +1,14 @@
 import os
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 
 import cv2
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
+from pose import classify_pose, draw_skeleton
 from video_stream import VideoStream
 
 ROTATION = int(os.getenv("ROTATION", "0"))
@@ -15,9 +16,11 @@ ROTATE_CODES = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTAT
 FRAME_WIDTH = int(os.getenv("FRAME_WIDTH", "640"))
 DETECT = os.getenv("DETECT", "1") == "1"
 TRACK = os.getenv("TRACK", "1") == "1"
+POSE = os.getenv("POSE", "1") == "1"
 TRAIL_LEN = int(os.getenv("TRAIL_LEN", "30"))
 TRACK_TTL = float(os.getenv("TRACK_TTL", "3"))
 MIN_SEEN_SECONDS = float(os.getenv("MIN_SEEN_SECONDS", "1.5"))
+POSE_SMOOTHING = int(os.getenv("POSE_SMOOTHING", "7"))
 
 if DETECT:
     from detector import PersonDetector
@@ -34,6 +37,7 @@ PALETTE = [
     (80, 220, 100), (255, 170, 60), (60, 170, 255), (220, 90, 220),
     (90, 230, 230), (240, 240, 90), (150, 120, 255), (255, 120, 120),
 ]
+ALERT_POSES = {"Hands Up", "Lying"}
 
 
 def color_for(track_id):
@@ -58,10 +62,14 @@ def draw(frame, detections, trails, total_seen):
         points = trails.get(tid, [])
         for a, b in zip(points, points[1:]):
             cv2.line(frame, a, b, color, 2)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        if POSE:
+            draw_skeleton(frame, d.get("keypoints"), d.get("kp_conf"), color)
+        box_color = (60, 60, 255) if d.get("pose") in ALERT_POSES else color
+        cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
         label = f"ID {tid}" if tid is not None else f"Person {i}"
-        label += f"  {d['conf']:.2f}"
-        cv2.putText(frame, label, (x1, max(y1 - 8, 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        if d.get("pose"):
+            label += f" | {d['pose']}"
+        cv2.putText(frame, label, (x1, max(y1 - 8, 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
     header = f"Persons: {len(detections)}   Seen: {total_seen}"
     cv2.rectangle(frame, (0, 0), (260, 30), (0, 0, 0), -1)
     cv2.putText(frame, header, (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
@@ -69,8 +77,8 @@ def draw(frame, detections, trails, total_seen):
 
 
 class CameraWorker:
-    """Reads the newest camera frame, runs detection + tracking once, and
-    keeps the annotated JPEG + detections ready for every viewer."""
+    """Reads the newest camera frame, runs detection + tracking + pose once,
+    and keeps the annotated JPEG + detections ready for every viewer."""
 
     def __init__(self, cam_id, source):
         self.id = cam_id
@@ -87,17 +95,26 @@ class CameraWorker:
 
     def _update_tracks(self, detections, now):
         for d in detections:
+            raw_pose = classify_pose(d["box"], d.get("keypoints"), d.get("kp_conf")) if POSE else None
             tid = d.get("id")
             if tid is None:
+                d["pose"] = raw_pose
                 continue
             x1, y1, x2, y2 = d["box"]
             center = ((x1 + x2) // 2, (y1 + y2) // 2)
             track = self.tracks.get(tid)
             if track is None:
-                track = {"first_seen": now, "trail": deque(maxlen=TRAIL_LEN)}
+                track = {
+                    "first_seen": now,
+                    "trail": deque(maxlen=TRAIL_LEN),
+                    "poses": deque(maxlen=POSE_SMOOTHING),
+                }
                 self.tracks[tid] = track
             track["last_seen"] = now
             track["trail"].append(center)
+            if raw_pose and raw_pose != "Unknown":
+                track["poses"].append(raw_pose)
+            d["pose"] = Counter(track["poses"]).most_common(1)[0][0] if track["poses"] else raw_pose
             d["duration"] = round(now - track["first_seen"], 1)
             if d["duration"] >= MIN_SEEN_SECONDS:
                 self.seen_ids.add(tid)
@@ -156,7 +173,10 @@ def get_worker(cam_id):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "cameras": len(workers), "detection": DETECT, "tracking": DETECT and TRACK}
+    return {
+        "ok": True, "cameras": len(workers), "detection": DETECT,
+        "tracking": DETECT and TRACK, "pose": DETECT and POSE,
+    }
 
 
 @app.get("/cameras")
@@ -164,9 +184,11 @@ def list_cameras():
     result = []
     for cid, w in workers.items():
         _, dets, fps, _, seen = w.snapshot()
+        poses = Counter(d.get("pose") for d in dets if d.get("pose"))
         result.append({
-            "id": cid, "online": w.online(), "persons": len(dets),
-            "seen": seen, "fps": round(fps, 1),
+            "id": cid, "online": w.online(), "persons": len(dets), "seen": seen,
+            "fps": round(fps, 1), "poses": dict(poses),
+            "alerts": sorted(p for p in poses if p in ALERT_POSES),
         })
     return result
 
