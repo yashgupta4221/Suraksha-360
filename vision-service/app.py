@@ -1,4 +1,5 @@
 import os
+import queue
 import threading
 import time
 from collections import Counter, deque
@@ -17,13 +18,24 @@ FRAME_WIDTH = int(os.getenv("FRAME_WIDTH", "640"))
 DETECT = os.getenv("DETECT", "1") == "1"
 TRACK = os.getenv("TRACK", "1") == "1"
 POSE = os.getenv("POSE", "1") == "1"
+GENDER = os.getenv("GENDER", "1") == "1"
 TRAIL_LEN = int(os.getenv("TRAIL_LEN", "30"))
 TRACK_TTL = float(os.getenv("TRACK_TTL", "3"))
 MIN_SEEN_SECONDS = float(os.getenv("MIN_SEEN_SECONDS", "1.5"))
 POSE_SMOOTHING = int(os.getenv("POSE_SMOOTHING", "7"))
+GENDER_EVERY = int(os.getenv("GENDER_EVERY", "10"))
+GENDER_MAX_VOTES = int(os.getenv("GENDER_MAX_VOTES", "15"))
+GENDER_MIN_VOTES = int(os.getenv("GENDER_MIN_VOTES", "3"))
+GENDER_MIN_CONF = float(os.getenv("GENDER_MIN_CONF", "0.75"))
 
 if DETECT:
     from detector import PersonDetector
+
+gender_model = None
+head_crop = None
+if DETECT and GENDER:
+    from gender import GenderClassifier, head_crop
+    gender_model = GenderClassifier()
 
 app = FastAPI(title="Suraksha360 Vision Service")
 app.add_middleware(
@@ -42,6 +54,26 @@ ALERT_POSES = {"Hands Up", "Lying"}
 
 def color_for(track_id):
     return PALETTE[track_id % len(PALETTE)] if track_id is not None else PALETTE[0]
+
+
+def gender_summary(probs):
+    if len(probs) < GENDER_MIN_VOTES:
+        return "uncertain", None
+    p = sum(probs) / len(probs)
+    if p >= GENDER_MIN_CONF:
+        return "female", p
+    if 1 - p >= GENDER_MIN_CONF:
+        return "male", 1 - p
+    return "uncertain", max(p, 1 - p)
+
+
+def gender_tag(d):
+    g, conf = d.get("gender"), d.get("gender_conf")
+    if g == "female":
+        return f"F {int(conf * 100)}%"
+    if g == "male":
+        return f"M {int(conf * 100)}%"
+    return "?"
 
 
 def prepare(frame):
@@ -69,6 +101,8 @@ def draw(frame, detections, trails, total_seen):
         label = f"ID {tid}" if tid is not None else f"Person {i}"
         if d.get("pose"):
             label += f" | {d['pose']}"
+        if gender_model is not None and tid is not None:
+            label += f" | {gender_tag(d)}"
         cv2.putText(frame, label, (x1, max(y1 - 8, 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
     header = f"Persons: {len(detections)}   Seen: {total_seen}"
     cv2.rectangle(frame, (0, 0), (260, 30), (0, 0, 0), -1)
@@ -77,9 +111,6 @@ def draw(frame, detections, trails, total_seen):
 
 
 class CameraWorker:
-    """Reads the newest camera frame, runs detection + tracking + pose once,
-    and keeps the annotated JPEG + detections ready for every viewer."""
-
     def __init__(self, cam_id, source):
         self.id = cam_id
         self.stream = VideoStream(source)
@@ -91,9 +122,46 @@ class CameraWorker:
         self.updated = 0.0
         self.tracks = {}
         self.seen_ids = set()
+        self.frame_no = 0
+        self.gender_queue = queue.Queue(maxsize=8)
+        self.gender_probs = {}
+        self.gender_last = {}
+        self.glock = threading.Lock()
         threading.Thread(target=self._loop, daemon=True).start()
+        if gender_model is not None:
+            threading.Thread(target=self._gender_loop, daemon=True).start()
 
-    def _update_tracks(self, detections, now):
+    def _gender_loop(self):
+        while True:
+            tid, crop = self.gender_queue.get()
+            try:
+                p = gender_model.p_female(crop)
+            except Exception as exc:
+                print(f"[gender] {exc}")
+                continue
+            if p is None:
+                continue
+            with self.glock:
+                self.gender_probs.setdefault(tid, deque(maxlen=GENDER_MAX_VOTES)).append(p)
+
+    def _update_gender(self, frame, d, tid):
+        with self.glock:
+            probs = list(self.gender_probs.get(tid, []))
+        due = self.frame_no - self.gender_last.get(tid, -10 ** 9) >= GENDER_EVERY
+        if len(probs) < GENDER_MAX_VOTES and due:
+            crop = head_crop(frame, d["box"], d.get("keypoints"), d.get("kp_conf"))
+            if crop is not None:
+                try:
+                    self.gender_queue.put_nowait((tid, crop))
+                    self.gender_last[tid] = self.frame_no
+                except queue.Full:
+                    pass
+        g, conf = gender_summary(probs)
+        d["gender"] = g
+        d["gender_conf"] = round(conf, 2) if conf is not None else None
+        d["gender_looks"] = len(probs)
+
+    def _update_tracks(self, frame, detections, now):
         for d in detections:
             raw_pose = classify_pose(d["box"], d.get("keypoints"), d.get("kp_conf")) if POSE else None
             tid = d.get("id")
@@ -118,8 +186,13 @@ class CameraWorker:
             d["duration"] = round(now - track["first_seen"], 1)
             if d["duration"] >= MIN_SEEN_SECONDS:
                 self.seen_ids.add(tid)
+            if gender_model is not None:
+                self._update_gender(frame, d, tid)
         for tid in [k for k, t in self.tracks.items() if now - t["last_seen"] > TRACK_TTL]:
             del self.tracks[tid]
+            self.gender_last.pop(tid, None)
+            with self.glock:
+                self.gender_probs.pop(tid, None)
         return {tid: list(t["trail"]) for tid, t in self.tracks.items()}
 
     def _loop(self):
@@ -133,15 +206,14 @@ class CameraWorker:
             if not ok or frame is None:
                 time.sleep(0.05)
                 continue
-
             start = time.time()
+            self.frame_no += 1
             frame = prepare(frame)
             detections = self.detector.detect(frame, track=TRACK) if self.detector else []
-            trails = self._update_tracks(detections, time.time())
+            trails = self._update_tracks(frame, detections, time.time())
             frame = draw(frame, detections, trails, len(self.seen_ids))
             _, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
             elapsed = time.time() - start
-
             with self.lock:
                 self.jpeg = jpg.tobytes()
                 self.detections = detections
@@ -176,6 +248,7 @@ def health():
     return {
         "ok": True, "cameras": len(workers), "detection": DETECT,
         "tracking": DETECT and TRACK, "pose": DETECT and POSE,
+        "gender": gender_model is not None,
     }
 
 
@@ -185,9 +258,12 @@ def list_cameras():
     for cid, w in workers.items():
         _, dets, fps, _, seen = w.snapshot()
         poses = Counter(d.get("pose") for d in dets if d.get("pose"))
+        genders = Counter(d.get("gender") for d in dets if d.get("gender"))
         result.append({
             "id": cid, "online": w.online(), "persons": len(dets), "seen": seen,
             "fps": round(fps, 1), "poses": dict(poses),
+            "genders": {k: genders.get(k, 0) for k in ("female", "male", "uncertain")}
+            if gender_model is not None else None,
             "alerts": sorted(p for p in poses if p in ALERT_POSES),
         })
     return result

@@ -11,6 +11,7 @@ type Camera = {
   seen?: number;
   fps?: number;
   poses?: Record<string, number>;
+  genders?: { female: number; male: number; uncertain: number } | null;
   alerts?: string[];
 };
 
@@ -105,6 +106,11 @@ export default function CctvPage() {
                       {pose}: {n}
                     </span>
                   ))}
+                  {c.genders && (
+                    <span className="rounded-full border px-2 py-0.5">
+                      ♀ {c.genders.female} · ♂ {c.genders.male} · ? {c.genders.uncertain}
+                    </span>
+                  )}
                   {typeof c.fps === "number" && <span className="ml-auto">{c.fps} FPS</span>}
                 </div>
               )}
