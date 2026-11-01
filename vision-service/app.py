@@ -10,6 +10,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from pose import classify_pose, draw_skeleton
+from fall import FallDetector
+from fight import FightDetector
 from video_stream import VideoStream
 
 ROTATION = int(os.getenv("ROTATION", "0"))
@@ -23,6 +25,8 @@ TRAIL_LEN = int(os.getenv("TRAIL_LEN", "30"))
 TRACK_TTL = float(os.getenv("TRACK_TTL", "3"))
 MIN_SEEN_SECONDS = float(os.getenv("MIN_SEEN_SECONDS", "1.5"))
 POSE_SMOOTHING = int(os.getenv("POSE_SMOOTHING", "7"))
+FALL = os.getenv("FALL", "1") == "1"
+FIGHT = os.getenv("FIGHT", "1") == "1"
 GENDER_EVERY = int(os.getenv("GENDER_EVERY", "10"))
 GENDER_MAX_VOTES = int(os.getenv("GENDER_MAX_VOTES", "15"))
 GENDER_MIN_VOTES = int(os.getenv("GENDER_MIN_VOTES", "3"))
@@ -96,14 +100,26 @@ def draw(frame, detections, trails, total_seen):
             cv2.line(frame, a, b, color, 2)
         if POSE:
             draw_skeleton(frame, d.get("keypoints"), d.get("kp_conf"), color)
-        box_color = (60, 60, 255) if d.get("pose") in ALERT_POSES else color
+        fallen = d.get("fall") == "fallen"
+        fighting = bool(d.get("fight"))
+        box_color = (60, 60, 255) if fallen or fighting or d.get("pose") in ALERT_POSES else color
         cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
         label = f"ID {tid}" if tid is not None else f"Person {i}"
         if d.get("pose"):
             label += f" | {d['pose']}"
         if gender_model is not None and tid is not None:
             label += f" | {gender_tag(d)}"
+        if fallen:
+            label = "FALL! " + label
+        if fighting:
+            label = "FIGHT! " + label
         cv2.putText(frame, label, (x1, max(y1 - 8, 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+    if any(d.get("fall") == "fallen" for d in detections):
+        cv2.rectangle(frame, (0, 32), (frame.shape[1], 70), (0, 0, 200), -1)
+        cv2.putText(frame, "FALL DETECTED", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+    if any(d.get("fight") for d in detections):
+        cv2.rectangle(frame, (0, 72), (frame.shape[1], 110), (0, 0, 200), -1)
+        cv2.putText(frame, "FIGHT DETECTED", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
     header = f"Persons: {len(detections)}   Seen: {total_seen}"
     cv2.rectangle(frame, (0, 0), (260, 30), (0, 0, 0), -1)
     cv2.putText(frame, header, (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
@@ -127,6 +143,9 @@ class CameraWorker:
         self.gender_probs = {}
         self.gender_last = {}
         self.glock = threading.Lock()
+        self.fall = FallDetector() if FALL else None
+        self.fight = FightDetector() if FIGHT else None
+        self.events = deque(maxlen=50)
         threading.Thread(target=self._loop, daemon=True).start()
         if gender_model is not None:
             threading.Thread(target=self._gender_loop, daemon=True).start()
@@ -188,8 +207,25 @@ class CameraWorker:
                 self.seen_ids.add(tid)
             if gender_model is not None:
                 self._update_gender(frame, d, tid)
+            if self.fall is not None:
+                fall_state, new_fall = self.fall.update(tid, now, d["box"], raw_pose)
+                d["fall"] = fall_state
+                if new_fall:
+                    self.events.appendleft({"type": "fall", "id": tid, "time": now})
+                    print(f"[fall] FALL DETECTED for ID {tid}")
+        if self.fight is not None:
+            fighting, new_fights = self.fight.update(now, detections)
+            for d in detections:
+                d["fight"] = d.get("id") in fighting
+            for pair in new_fights:
+                self.events.appendleft({"type": "fight", "ids": list(pair), "time": now})
+                print(f"[fight] FIGHT DETECTED between IDs {pair[0]} and {pair[1]}")
         for tid in [k for k, t in self.tracks.items() if now - t["last_seen"] > TRACK_TTL]:
             del self.tracks[tid]
+            if self.fall is not None:
+                self.fall.forget(tid)
+            if self.fight is not None:
+                self.fight.forget(tid)
             self.gender_last.pop(tid, None)
             with self.glock:
                 self.gender_probs.pop(tid, None)
@@ -264,7 +300,11 @@ def list_cameras():
             "fps": round(fps, 1), "poses": dict(poses),
             "genders": {k: genders.get(k, 0) for k in ("female", "male", "uncertain")}
             if gender_model is not None else None,
-            "alerts": sorted(p for p in poses if p in ALERT_POSES),
+            "alerts": sorted(
+                {p for p in poses if p in ALERT_POSES}
+                | ({"Fall Detected"} if any(d.get("fall") == "fallen" for d in dets) else set())
+                | ({"Fight Detected"} if any(d.get("fight") for d in dets) else set())
+            ),
         })
     return result
 
@@ -295,3 +335,11 @@ def stream(cam_id: str):
         mjpeg(get_worker(cam_id)),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
+
+
+@app.get("/events")
+def events():
+    out = []
+    for cid, w in workers.items():
+        out.extend({"camera": cid, **e} for e in list(w.events))
+    return sorted(out, key=lambda e: e["time"], reverse=True)[:50]
