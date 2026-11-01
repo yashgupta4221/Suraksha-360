@@ -38,6 +38,7 @@ function pickNearestGovtSafeHaven(zones: SafeZone[]): SafeZone | null {
 }
 
 const ESCALATION_SECONDS = 10;
+const AUTO_CALL_NUMBER = process.env.NEXT_PUBLIC_SOS_AUTO_CALL_NUMBER ?? "";
 
 // Full-screen SOS confirmation + escalation overlay. Triggered by any
 // silent-SOS gesture (double-tap, shake) or the manual SOS button. Voice
@@ -103,6 +104,16 @@ export function SosOverlay() {
     }, 1000);
     return () => clearInterval(interval);
   }, [status, escalate]);
+
+  // Auto-call once per SOS, right after the 10 s countdown escalates.
+  const autoCalledForTriggerRef = React.useRef<number | null>(null);
+  React.useEffect(() => {
+    if (status !== "escalated" || !AUTO_CALL_NUMBER) return;
+    if (autoCalledForTriggerRef.current === triggeredAt) return;
+    autoCalledForTriggerRef.current = triggeredAt;
+    toast.error(`Calling ${AUTO_CALL_NUMBER} now…`);
+    window.location.href = `tel:${AUTO_CALL_NUMBER}`;
+  }, [status, triggeredAt]);
 
   React.useEffect(() => {
     if (status !== "escalated") return;
@@ -200,7 +211,7 @@ export function SosOverlay() {
             <>
               <div className="flex flex-col items-center gap-1">
                 <p className="text-4xl font-bold tabular-nums text-destructive">{secondsLeft}</p>
-                <p className="text-xs text-muted-foreground">seconds until escalation</p>
+                <p className="text-xs text-muted-foreground">{AUTO_CALL_NUMBER ? `seconds until calling ${AUTO_CALL_NUMBER}` : "seconds until escalation"}</p>
               </div>
               <Button variant="secondary" size="lg" className="w-full" onClick={cancel}>
                 {t("sos.imSafeCancel")}
