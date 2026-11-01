@@ -448,11 +448,11 @@ export function formatDuration(seconds: number) {
   return `${hrs}h ${mins % 60}m`;
 }
 
-export function googleMapsDirectionsUrl(origin: GeoPoint, destination: GeoPoint, mode: string) {
+export function googleMapsDirectionsUrl(origin: GeoPoint | null | undefined, destination: GeoPoint, mode: string) {
   const travelmode = mode === "walking" ? "walking" : "driving";
   const params = new URLSearchParams({
     api: "1",
-    origin: `${origin.lat},${origin.lng}`,
+    ...(origin ? { origin: `${origin.lat},${origin.lng}` } : {}),
     destination: `${destination.lat},${destination.lng}`,
     travelmode,
   });
